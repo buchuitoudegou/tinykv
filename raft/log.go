@@ -137,7 +137,7 @@ func (l *RaftLog) DeleteFromIdx(idx int) {
 
 func (l *RaftLog) GetEntries(begIdx int, endIdx int) []pb.Entry {
 	ret := []pb.Entry{}
-	for i := begIdx - 1; i >= 0 && i <= endIdx && i < len(l.entries); i++ {
+	for i := begIdx - 1; i >= 0 && i < endIdx && i < len(l.entries); i++ {
 		ret = append(ret, l.entries[i])
 	}
 	return ret
