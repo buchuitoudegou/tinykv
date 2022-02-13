@@ -71,8 +71,6 @@ type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
 	prevCommittedIdx uint64
-	softState        *SoftState
-	hardState        *pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -82,24 +80,7 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	return &RawNode{
 		Raft:             raftInst,
 		prevCommittedIdx: 0, // no entries committed
-		softState: &SoftState{
-			Lead:      raftInst.Lead,
-			RaftState: raftInst.State,
-		},
-		hardState: &pb.HardState{
-			Term:   raftInst.Term,
-			Vote:   raftInst.Vote,
-			Commit: raftInst.RaftLog.committed,
-		},
 	}, nil
-}
-
-func diffSoftState(s1, s2 *SoftState) bool {
-	return s1.Lead != s2.Lead || s1.RaftState != s2.RaftState
-}
-
-func diffHardState(h1, h2 *pb.HardState) bool {
-	return h1.Term != h2.Term || h1.Vote != h2.Vote || h1.Commit != h2.Commit
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -167,35 +148,13 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	// upperBound := min(rn.Raft.RaftLog.committed, rn.Raft.RaftLog.stabled)
-	var (
-		needSoftState bool
-		needHardState bool
-	)
 	committedEntries := rn.Raft.RaftLog.GetEntries(int(rn.prevCommittedIdx)+1, int(rn.Raft.RaftLog.committed))
 	rn.prevCommittedIdx = rn.Raft.RaftLog.committed // committed entries
 	msgs := rn.Raft.msgs
 	rn.Raft.msgs = []pb.Message{}
-	raftSoftState := &SoftState{
-		Lead:      rn.Raft.Lead,
-		RaftState: rn.Raft.State,
-	}
-	raftHardState := &pb.HardState{
-		Term:   rn.Raft.Term,
-		Vote:   rn.Raft.Vote,
-		Commit: rn.Raft.RaftLog.committed,
-	}
-	needSoftState = diffSoftState(raftSoftState, rn.softState)
-	needHardState = diffHardState(raftHardState, rn.hardState)
 	ret := Ready{
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		CommittedEntries: committedEntries,
-	}
-	if needSoftState {
-		ret.SoftState = raftSoftState
-	}
-	if needHardState {
-		ret.HardState = *raftHardState
 	}
 	if len(msgs) > 0 {
 		ret.Messages = msgs
