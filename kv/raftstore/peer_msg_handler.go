@@ -2,13 +2,17 @@ package raftstore
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/Connor1996/badger"
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
@@ -38,11 +42,80 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+func encodeCmd(typ raft_cmdpb.CmdType, cf string, key, val []byte) []byte {
+	var ret string
+	switch typ {
+	case raft_cmdpb.CmdType_Put:
+		ret += "Put;"
+	case raft_cmdpb.CmdType_Delete:
+		ret += "Del;"
+	}
+	ret += cf + ";"
+	ret += string(key) + ";"
+	ret += string(val)
+	return []byte(ret)
+}
+
+func decodeCmd(data []byte) (raft_cmdpb.CmdType, string, []byte, []byte, error) {
+	var (
+		typ      raft_cmdpb.CmdType
+		cf       string
+		key, val []byte
+	)
+	temp := string(data)
+	ret := strings.Split(temp, ";")
+	if len(ret) != 4 {
+		return raft_cmdpb.CmdType_Invalid, "", []byte{}, []byte{}, errors.New("decoding invalid raft cmd")
+	}
+	switch ret[0] {
+	case "Put":
+		typ = raft_cmdpb.CmdType_Put
+	case "Del":
+		typ = raft_cmdpb.CmdType_Delete
+	}
+	cf = ret[1]
+	key = []byte(ret[2])
+	val = []byte(ret[3])
+	return typ, cf, key, val, nil
+}
+
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
 	// Your Code Here (2B).
+	if d.peer.RaftGroup.HasReady() {
+		rd := d.peer.RaftGroup.Ready()
+		d.peer.peerStorage.SaveReadyState(&rd) // save unstabled entries, HardState, SoftState
+		for _, msg := range rd.Messages {
+			// todo: handle sending error
+			d.peer.sendRaftMessage(msg, d.ctx.trans)
+		}
+		// write to KV:
+		// 1. new committed key-val
+		// 2. new applyState
+		wb := engine_util.WriteBatch{}
+		for _, entry := range rd.CommittedEntries {
+			// committed entries
+			typ, cf, key, val, err := decodeCmd(entry.Data)
+			if err != nil {
+				// never reach here
+				return
+			}
+			if typ == raft_cmdpb.CmdType_Put {
+				wb.SetCF(cf, key, val)
+			} else {
+				wb.DeleteCF(cf, key)
+			}
+		}
+		// save applyState
+		if len(rd.CommittedEntries) > 0 {
+			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)].Index
+		}
+		wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		wb.WriteToDB(d.peerStorage.Engines.Kv)
+		d.peer.RaftGroup.Advance(rd)
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -114,6 +187,45 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{
+			CurrentTerm: d.peer.Term(),
+		},
+	}
+	for _, req := range msg.Requests {
+		resp := &raft_cmdpb.Response{}
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			resp.CmdType = raft_cmdpb.CmdType_Get
+			err := d.peerStorage.Engines.Kv.View(func(txn *badger.Txn) error {
+				item, err := txn.Get(req.Get.Key)
+				if err != nil {
+					return err
+				}
+				val := item.Key()
+				resp.Get = &raft_cmdpb.GetResponse{
+					Value: val,
+				}
+
+				return nil
+			})
+			if err != nil {
+				resp.Get = &raft_cmdpb.GetResponse{
+					Value: []byte{},
+				}
+			}
+		case raft_cmdpb.CmdType_Put, raft_cmdpb.CmdType_Delete:
+			resp.CmdType = req.CmdType
+			d.peer.RaftGroup.Propose(encodeCmd(
+				req.CmdType,
+				req.Put.Cf,
+				req.Put.Key,
+				req.Put.Value,
+			))
+		}
+		cmdResp.Responses = append(cmdResp.Responses, resp)
+	}
+	cb.Done(cmdResp)
 }
 
 func (d *peerMsgHandler) onTick() {
