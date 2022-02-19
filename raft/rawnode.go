@@ -76,7 +76,14 @@ type RawNode struct {
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
+	hardState, confState, err := config.Storage.InitialState()
+	if len(config.peers) == 0 {
+		config.peers = confState.Nodes
+	}
 	raftInst := newRaft(config)
+	if err != nil {
+		hardState = pb.HardState{}
+	}
 	return &RawNode{
 		Raft:             raftInst,
 		prevCommittedIdx: 0, // no entries committed

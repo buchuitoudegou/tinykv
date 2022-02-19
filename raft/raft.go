@@ -199,8 +199,8 @@ func newRaft(c *Config) *Raft {
 	return retRaft
 }
 
-func randomizeElectionTimeout() int {
-	return rand.Intn(10) + 10
+func (r *Raft) randomizeElectionTimeout() int {
+	return rand.Intn(20) + 10
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -389,7 +389,7 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 					r.becomeCandidate()
 					r.electionElapsed = 0
-					r.electionTimeout = randomizeElectionTimeout()
+					r.electionTimeout = r.randomizeElectionTimeout()
 					// broadcast
 					r.broadcastVoteRequest()
 				}
@@ -444,7 +444,7 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 					r.becomeCandidate()
 					r.electionElapsed = 0
-					r.electionTimeout = randomizeElectionTimeout()
+					r.electionTimeout = r.randomizeElectionTimeout()
 					// broadcast
 					r.broadcastVoteRequest()
 				}

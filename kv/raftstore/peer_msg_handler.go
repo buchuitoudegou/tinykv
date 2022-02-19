@@ -56,7 +56,7 @@ func encodeCmd(typ raft_cmdpb.CmdType, cf string, key, val []byte) []byte {
 	return []byte(ret)
 }
 
-func decodeCmd(data []byte) (raft_cmdpb.CmdType, string, []byte, []byte, error) {
+func decodeCmd(data []byte) (raft_cmdpb.CmdType, string, []byte, []byte) {
 	var (
 		typ      raft_cmdpb.CmdType
 		cf       string
@@ -65,7 +65,7 @@ func decodeCmd(data []byte) (raft_cmdpb.CmdType, string, []byte, []byte, error) 
 	temp := string(data)
 	ret := strings.Split(temp, ";")
 	if len(ret) != 4 {
-		return raft_cmdpb.CmdType_Invalid, "", []byte{}, []byte{}, errors.New("decoding invalid raft cmd")
+		return raft_cmdpb.CmdType_Invalid, "", []byte{}, []byte{}
 	}
 	switch ret[0] {
 	case "Put":
@@ -76,7 +76,7 @@ func decodeCmd(data []byte) (raft_cmdpb.CmdType, string, []byte, []byte, error) 
 	cf = ret[1]
 	key = []byte(ret[2])
 	val = []byte(ret[3])
-	return typ, cf, key, val, nil
+	return typ, cf, key, val
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {
@@ -97,10 +97,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		wb := engine_util.WriteBatch{}
 		for _, entry := range rd.CommittedEntries {
 			// committed entries
-			typ, cf, key, val, err := decodeCmd(entry.Data)
-			if err != nil {
-				// never reach here
-				return
+			typ, cf, key, val := decodeCmd(entry.Data)
+			if typ == raft_cmdpb.CmdType_Invalid {
+				// noop entry
+				continue
 			}
 			if typ == raft_cmdpb.CmdType_Put {
 				wb.SetCF(cf, key, val)
@@ -110,7 +110,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		}
 		// save applyState
 		if len(rd.CommittedEntries) > 0 {
-			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)].Index
+			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		}
 		wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		wb.WriteToDB(d.peerStorage.Engines.Kv)
@@ -187,16 +187,17 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-	cmdResp := &raft_cmdpb.RaftCmdResponse{
+	cb.Resp = &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{
 			CurrentTerm: d.peer.Term(),
 		},
 	}
 	for _, req := range msg.Requests {
-		resp := &raft_cmdpb.Response{}
+		resp := &raft_cmdpb.Response{
+			CmdType: req.CmdType,
+		}
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Get:
-			resp.CmdType = raft_cmdpb.CmdType_Get
 			err := d.peerStorage.Engines.Kv.View(func(txn *badger.Txn) error {
 				item, err := txn.Get(req.Get.Key)
 				if err != nil {
@@ -215,17 +216,27 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				}
 			}
 		case raft_cmdpb.CmdType_Put, raft_cmdpb.CmdType_Delete:
-			resp.CmdType = req.CmdType
 			d.peer.RaftGroup.Propose(encodeCmd(
 				req.CmdType,
 				req.Put.Cf,
 				req.Put.Key,
 				req.Put.Value,
 			))
+		case raft_cmdpb.CmdType_Snap:
+			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // snapshot read
+			snap := &raft_cmdpb.SnapResponse{
+				Region: &metapb.Region{
+					Id:       d.PeerId(),
+					StartKey: d.Region().StartKey,
+					EndKey:   d.Region().EndKey,
+					Peers:    []*metapb.Peer{}, // todo: fill this array
+				},
+			}
+			resp.Snap = snap
 		}
-		cmdResp.Responses = append(cmdResp.Responses, resp)
+		cb.Resp.Responses = append(cb.Resp.Responses, resp)
 	}
-	cb.Done(cmdResp)
+	cb.Done(cb.Resp)
 }
 
 func (d *peerMsgHandler) onTick() {
