@@ -108,12 +108,58 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				wb.DeleteCF(cf, key)
 			}
 		}
-		// save applyState
 		if len(rd.CommittedEntries) > 0 {
+			// save applyState
 			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+			wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		}
-		wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-		wb.WriteToDB(d.peerStorage.Engines.Kv)
+		err := wb.WriteToDB(d.peerStorage.Engines.Kv)
+		if err != nil {
+			panic("err occurs when writing KV")
+		}
+		if len(rd.CommittedEntries) > 0 {
+			// update region
+			var (
+				start, end []byte
+			)
+			err = d.peerStorage.Engines.Kv.View(func(txn *badger.Txn) error {
+				iter := engine_util.NewCFIterator(engine_util.CfDefault, txn)
+				iter.Seek([]byte{}) // seek to first
+				defer iter.Close()
+				if !iter.Valid() {
+					return errors.New("iter not valid for start key")
+				} else {
+					start = iter.Item().Key()
+				}
+				// lstKey := iter.Item().Key()
+				// for ; iter.Valid(); iter.Next() {
+				// 	lstKey = iter.Item().Key()
+				// }
+				// end = lstKey
+				// fmt.Printf("id: %d, update region end: %s\n", d.peer.storeID(), string(end))
+				return nil
+			})
+			if err != nil {
+				log.Warnf("fail to get new region info: %s", err.Error())
+			}
+			curRegion := d.peer.Region()
+			curRegion.StartKey = start
+			curRegion.EndKey = end
+			d.peer.SetRegion(curRegion)
+		}
+		appliedIdx := d.peerStorage.applyState.AppliedIndex
+		newProposals := make([]*proposal, 0)
+		for idx := range d.peer.proposals {
+			if d.peer.proposals[idx].index <= appliedIdx &&
+				d.peer.proposals[idx].term == d.peer.Term() {
+				// 1. index <= appliedIdx and
+				// 2. propose term == current term
+				d.peer.proposals[idx].cb.Done(d.peer.proposals[idx].cb.Resp)
+			} else {
+				newProposals = append(newProposals, d.peer.proposals[idx])
+			}
+		}
+		d.peer.proposals = newProposals
 		d.peer.RaftGroup.Advance(rd)
 	}
 }
@@ -187,6 +233,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	proposal := &proposal{
+		cb: cb,
+	}
 	cb.Resp = &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{
 			CurrentTerm: d.peer.Term(),
@@ -215,13 +264,28 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 					Value: []byte{},
 				}
 			}
-		case raft_cmdpb.CmdType_Put, raft_cmdpb.CmdType_Delete:
+		case raft_cmdpb.CmdType_Put:
 			d.peer.RaftGroup.Propose(encodeCmd(
 				req.CmdType,
 				req.Put.Cf,
 				req.Put.Key,
 				req.Put.Value,
 			))
+			lstLogIdx := d.peer.RaftGroup.Raft.RaftLog.LastIndex()
+			lstLogTerm, _ := d.peer.RaftGroup.Raft.RaftLog.Term(lstLogIdx)
+			proposal.index = lstLogIdx
+			proposal.term = lstLogTerm
+		case raft_cmdpb.CmdType_Delete:
+			d.peer.RaftGroup.Propose(encodeCmd(
+				req.CmdType,
+				req.Delete.Cf,
+				req.Delete.Key,
+				[]byte(""),
+			))
+			lstLogIdx := d.peer.RaftGroup.Raft.RaftLog.LastIndex()
+			lstLogTerm, _ := d.peer.RaftGroup.Raft.RaftLog.Term(lstLogIdx)
+			proposal.index = lstLogIdx
+			proposal.term = lstLogTerm
 		case raft_cmdpb.CmdType_Snap:
 			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // snapshot read
 			snap := &raft_cmdpb.SnapResponse{
@@ -236,7 +300,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		}
 		cb.Resp.Responses = append(cb.Resp.Responses, resp)
 	}
-	cb.Done(cb.Resp)
+	d.peer.proposals = append(d.peer.proposals, proposal)
 }
 
 func (d *peerMsgHandler) onTick() {
