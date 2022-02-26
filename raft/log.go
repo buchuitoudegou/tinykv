@@ -54,6 +54,7 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	curLogIdx uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -67,13 +68,17 @@ func newLog(storage Storage) *RaftLog {
 		stabled:         0,
 		entries:         []pb.Entry{},
 		pendingSnapshot: nil,
+		curLogIdx:       0,
 	}
 	// todo: copy entries from storage
 	begIdx, err1 := storage.FirstIndex()
 	endIdx, err2 := storage.LastIndex()
+	if err2 == nil {
+		newRaft.curLogIdx = endIdx
+		newRaft.stabled = endIdx
+	}
 	if err1 == nil && err2 == nil && begIdx <= endIdx {
 		newRaft.entries, _ = storage.Entries(begIdx, endIdx+1)
-		newRaft.stabled = endIdx
 	}
 	return newRaft
 }
@@ -88,69 +93,98 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	ret := []pb.Entry{}
-	for i := l.stabled; i < uint64(len(l.entries)); i++ {
-		ret = append(ret, l.entries[i])
-	}
-	return ret
+	return l.GetEntries(int(l.stabled)+1, int(l.LastIndex()))
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	ret := []pb.Entry{}
-	for i := l.applied; i <= l.committed-1; i++ {
-		ret = append(ret, l.entries[i])
-	}
-	return ret
+	return l.GetEntries(int(l.applied)+1, int(l.committed))
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	if len(l.entries) == 0 {
-		return 0
-	}
-	return l.entries[len(l.entries)-1].Index
+	return l.curLogIdx
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if int(i) > len(l.entries) || i <= 0 {
+	if l.curLogIdx == 0 || i == 0 || i > l.LastIndex() {
 		return 0, fmt.Errorf("index out of range")
 	}
-	return l.entries[i-1].Term, nil
+	ents := l.GetEntries(int(i), int(i))
+	if len(ents) > 0 {
+		return ents[0].Term, nil
+	} else {
+		return 0, nil
+	}
 }
 
 func (l *RaftLog) NextIndex() uint64 {
-	return uint64(len(l.entries)) + 1
+	return l.curLogIdx + 1
 }
 
 func (l *RaftLog) DeleteFromIdx(idx int) {
-	if idx > 0 && idx < len(l.entries) {
-		l.entries = l.entries[idx-1:]
-	} else if idx == 0 {
+	if idx < 0 {
+		return
+	}
+	if idx == 0 {
+		// delete all
 		l.entries = []pb.Entry{}
+		l.curLogIdx = 0
+	}
+	if len(l.entries) == 0 {
+		// decrease curLogIdx
+		if int(l.curLogIdx) >= idx {
+			l.curLogIdx = uint64(idx)
+		}
+	} else {
+		if int(l.entries[0].Index) > idx {
+			// try deleting index in storage
+			// noop
+		} else {
+			gap := idx - int(l.entries[0].Index)
+			if gap < len(l.entries) {
+				if gap < 0 {
+					// delete all from entries
+					l.curLogIdx = l.entries[0].Index - 1
+					l.entries = []pb.Entry{}
+				} else {
+					l.curLogIdx = l.entries[gap].Index
+					l.entries = l.entries[:gap+1]
+				}
+			}
+		}
 	}
 }
 
 func (l *RaftLog) GetEntries(begIdx int, endIdx int) []pb.Entry {
+	if len(l.entries) == 0 || begIdx < int(l.entries[0].Index) {
+		// todo: get entries from stroage
+		return []pb.Entry{}
+	}
 	ret := []pb.Entry{}
-	for i := begIdx - 1; i >= 0 && i < endIdx && i < len(l.entries); i++ {
+	beg := begIdx - int(l.entries[0].Index)
+	end := endIdx - int(l.entries[0].Index)
+	for i := beg; i >= 0 && i <= end && i < len(l.entries); i++ {
 		ret = append(ret, l.entries[i])
 	}
 	return ret
 }
 
 func (l *RaftLog) AppendEntry(index uint64, newEntry pb.Entry) {
+	logTerm, _ := l.Term(index)
 	if index == l.NextIndex() {
 		l.entries = append(l.entries, newEntry)
-	} else if index < l.NextIndex() && index >= 1 && newEntry.Term != l.entries[index-1].Term {
+		l.curLogIdx = index
+	} else if index < l.NextIndex() && index >= 1 && newEntry.Term != logTerm {
 		// 1. entry of the index already exists
 		// 2. new entry has different term (i.e. different entry)
 		// then modify the original entry and delete its followings
-		l.entries[index-1] = newEntry
+		i := index - l.entries[0].Index
+		l.entries[i] = newEntry
 		if index <= l.stabled {
 			l.stabled = index - 1
 		}
@@ -158,6 +192,7 @@ func (l *RaftLog) AppendEntry(index uint64, newEntry pb.Entry) {
 			l.applied = index - 1
 		}
 		// delete the following entries
-		l.entries = l.entries[:index]
+		l.entries = l.entries[:i+1]
+		l.curLogIdx = newEntry.Index
 	}
 }

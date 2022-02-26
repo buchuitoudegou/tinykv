@@ -630,7 +630,7 @@ func (r *Raft) Step(m pb.Message) error {
 				{
 					// todo: append an entry to RaftLog
 					for i := range m.Entries {
-						r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+						r.RaftLog.AppendEntry(r.RaftLog.NextIndex(), pb.Entry{
 							Index:     r.RaftLog.NextIndex(),
 							Term:      r.Term,
 							EntryType: m.Entries[i].EntryType,
@@ -686,10 +686,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			logTerm, _ := r.RaftLog.Term(m.Index)
 			if logTerm != m.LogTerm {
 				replyMsg.Reject = true
-				r.msgs = append(r.msgs, replyMsg)
 				// delete all entries from prevLogIndex
-				r.RaftLog.DeleteFromIdx(int(m.Index) - 1)
+				// r.RaftLog.DeleteFromIdx(int(m.Index) - 1)
 				replyMsg.Index = r.RaftLog.LastIndex()
+				r.msgs = append(r.msgs, replyMsg)
 				return
 			}
 			// legal
