@@ -71,21 +71,23 @@ type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
 	prevCommittedIdx uint64
+	hardState        pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
 	hardState, confState, err := config.Storage.InitialState()
+	if err != nil {
+		return nil, err
+	}
 	if len(config.peers) == 0 {
 		config.peers = confState.Nodes
 	}
 	raftInst := newRaft(config)
-	if err != nil {
-		hardState = pb.HardState{}
-	}
 	return &RawNode{
 		Raft:             raftInst,
+		hardState:        hardState,
 		prevCommittedIdx: 0, // no entries committed
 	}, nil
 }
@@ -163,16 +165,30 @@ func (rn *RawNode) Ready() Ready {
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		CommittedEntries: committedEntries,
 	}
+	if rn.diffHardState() {
+		ret.HardState = pb.HardState{
+			Vote:   rn.Raft.Vote,
+			Commit: rn.Raft.RaftLog.committed,
+			Term:   rn.Raft.Term,
+		}
+	}
 	if len(msgs) > 0 {
 		ret.Messages = msgs
 	}
 	return ret
 }
 
+func (rn *RawNode) diffHardState() bool {
+	return rn.Raft.Vote != rn.hardState.Vote || rn.Raft.RaftLog.committed != rn.hardState.Commit || rn.Raft.Term != rn.hardState.Term
+}
+
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
 	if len(rn.Raft.msgs) > 0 {
+		return true
+	}
+	if rn.diffHardState() {
 		return true
 	}
 	unstabledEnts := rn.Raft.RaftLog.unstableEntries() // entries to be saved
@@ -194,6 +210,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 {
 		lstIdx := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		rn.Raft.RaftLog.applied = lstIdx
+	}
+	if rd.HardState.Term != 0 {
+		rn.hardState = rd.HardState
 	}
 }
 
