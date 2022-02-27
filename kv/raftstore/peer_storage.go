@@ -351,11 +351,13 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	wb := &engine_util.WriteBatch{}
 	if len(ready.Entries) > 0 {
 		ps.Append(ready.Entries, wb)
-		wb.WriteToDB(ps.Engines.Raft)
 	}
-	ps.raftState.HardState = &ready.HardState
+	if ready.HardState.Term != 0 {
+		ps.raftState.HardState = &ready.HardState
+	}
 	// save raftState
 	wb.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	wb.WriteToDB(ps.Engines.Raft)
 	return nil, nil
 }
 

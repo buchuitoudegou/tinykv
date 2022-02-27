@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -340,6 +341,13 @@ func (r *Raft) becomeLeader() {
 		EntryType: pb.EntryType_EntryNormal,
 		Data:      nil,
 	}
+	voteMsg := ""
+	for v := range r.votes {
+		if r.votes[v] {
+			voteMsg += fmt.Sprintf("%d,", v)
+		}
+	}
+	fmt.Printf("%d become leader, vote by %s at term %d\n", r.id, voteMsg, r.Term)
 	r.Step(pb.Message{
 		From:    r.id,
 		To:      r.id,
@@ -618,6 +626,7 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 					if commitIdx != r.RaftLog.committed {
 						// commit new entry
+						fmt.Printf("node %d commit log %d\n", r.id, commitIdx)
 						r.RaftLog.committed = uint64(commitIdx)
 						for id := range r.Prs {
 							if id != r.id {
@@ -708,6 +717,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 					// prevLogIdx is the newest
 					r.RaftLog.committed = min(m.Commit, m.Index)
 				}
+				fmt.Printf("node %d commit up to %d\n", r.id, r.RaftLog.committed)
 			}
 			replyMsg.Reject = false
 			replyMsg.Index = r.RaftLog.LastIndex()

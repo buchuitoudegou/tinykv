@@ -95,6 +95,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// 1. new committed key-val
 		// 2. new applyState
 		wb := engine_util.WriteBatch{}
+		indexToTypeM := make(map[uint64]raft_cmdpb.CmdType, 0)
 		for _, entry := range rd.CommittedEntries {
 			// committed entries
 			typ, cf, key, val := decodeCmd(entry.Data)
@@ -102,9 +103,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				// noop entry
 				continue
 			}
-			if typ == raft_cmdpb.CmdType_Put {
+			switch typ {
+			case raft_cmdpb.CmdType_Put:
+				indexToTypeM[entry.GetIndex()] = raft_cmdpb.CmdType_Put
 				wb.SetCF(cf, key, val)
-			} else {
+			case raft_cmdpb.CmdType_Delete:
+				indexToTypeM[entry.GetIndex()] = raft_cmdpb.CmdType_Delete
 				wb.DeleteCF(cf, key)
 			}
 		}
@@ -154,7 +158,22 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				d.peer.proposals[idx].term == d.peer.Term() {
 				// 1. index <= appliedIdx and
 				// 2. propose term == current term
-				d.peer.proposals[idx].cb.Done(d.peer.proposals[idx].cb.Resp)
+				curIdx := d.peer.proposals[idx].index
+				resp := d.peer.proposals[idx].cb.Resp
+				if resp == nil {
+					// put or delete response
+					resp = &raft_cmdpb.RaftCmdResponse{
+						Header: &raft_cmdpb.RaftResponseHeader{
+							CurrentTerm: d.peer.Term(),
+						},
+						Responses: []*raft_cmdpb.Response{},
+					}
+					resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+						CmdType: indexToTypeM[curIdx],
+					})
+					fmt.Printf("node %d apply and commit log idx: %d\n", d.peer.PeerId(), curIdx)
+				}
+				d.peer.proposals[idx].cb.Done(resp)
 			} else {
 				newProposals = append(newProposals, d.peer.proposals[idx])
 			}
@@ -233,59 +252,59 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	isReadOnly := true
 	proposal := &proposal{
-		cb: cb,
+		cb:   cb,
+		term: d.peer.Term(),
 	}
-	cb.Resp = &raft_cmdpb.RaftCmdResponse{
+	curResp := &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{
 			CurrentTerm: d.peer.Term(),
 		},
 	}
+	// currently, one RaftCmdRequest consists of only one Request
 	for _, req := range msg.Requests {
 		resp := &raft_cmdpb.Response{
 			CmdType: req.CmdType,
 		}
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Get:
-			err := d.peerStorage.Engines.Kv.View(func(txn *badger.Txn) error {
-				item, err := txn.Get(req.Get.Key)
-				if err != nil {
-					return err
+			val, err := engine_util.GetCF(d.peer.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+			if err != nil {
+				resp.Get = &raft_cmdpb.GetResponse{
+					Value: []byte(err.Error()),
 				}
-				val := item.Key()
+			} else {
 				resp.Get = &raft_cmdpb.GetResponse{
 					Value: val,
 				}
-
-				return nil
-			})
-			if err != nil {
-				resp.Get = &raft_cmdpb.GetResponse{
-					Value: []byte{},
-				}
 			}
+			curResp.Responses = append(curResp.Responses, resp)
 		case raft_cmdpb.CmdType_Put:
+			isReadOnly = false
+			nxtLogIdx := d.peer.RaftGroup.Raft.RaftLog.NextIndex()
+			curTerm := d.peer.Term()
+			proposal.index = nxtLogIdx
+			proposal.term = curTerm
 			d.peer.RaftGroup.Propose(encodeCmd(
 				req.CmdType,
 				req.Put.Cf,
 				req.Put.Key,
 				req.Put.Value,
 			))
-			lstLogIdx := d.peer.RaftGroup.Raft.RaftLog.LastIndex()
-			lstLogTerm, _ := d.peer.RaftGroup.Raft.RaftLog.Term(lstLogIdx)
-			proposal.index = lstLogIdx
-			proposal.term = lstLogTerm
+			fmt.Printf("put %s %s by log idx %d\n", string(req.Put.Key), string(req.Put.Value), nxtLogIdx)
 		case raft_cmdpb.CmdType_Delete:
+			isReadOnly = false
+			nxtLogIdx := d.peer.RaftGroup.Raft.RaftLog.NextIndex()
+			curTerm := d.peer.Term()
+			proposal.index = nxtLogIdx
+			proposal.term = curTerm
 			d.peer.RaftGroup.Propose(encodeCmd(
 				req.CmdType,
 				req.Delete.Cf,
 				req.Delete.Key,
 				[]byte(""),
 			))
-			lstLogIdx := d.peer.RaftGroup.Raft.RaftLog.LastIndex()
-			lstLogTerm, _ := d.peer.RaftGroup.Raft.RaftLog.Term(lstLogIdx)
-			proposal.index = lstLogIdx
-			proposal.term = lstLogTerm
 		case raft_cmdpb.CmdType_Snap:
 			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // snapshot read
 			snap := &raft_cmdpb.SnapResponse{
@@ -297,8 +316,11 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				},
 			}
 			resp.Snap = snap
+			curResp.Responses = append(curResp.Responses, resp)
 		}
-		cb.Resp.Responses = append(cb.Resp.Responses, resp)
+	}
+	if isReadOnly {
+		proposal.cb.Resp = curResp
 	}
 	d.peer.proposals = append(d.peer.proposals, proposal)
 }
