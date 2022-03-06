@@ -161,11 +161,28 @@ func (l *RaftLog) DeleteFromIdx(idx int) {
 }
 
 func (l *RaftLog) GetEntries(begIdx int, endIdx int) []pb.Entry {
-	if len(l.entries) == 0 || begIdx < int(l.entries[0].Index) {
-		// todo: get entries from stroage
-		return []pb.Entry{}
-	}
+	// if len(l.entries) == 0 || begIdx < int(l.entries[0].Index) {
+	// 	// todo: get entries from stroage
+	// 	return []pb.Entry{}
+	// }
 	ret := []pb.Entry{}
+	var err error
+	if len(l.entries) == 0 {
+		if l.curLogIdx < uint64(endIdx) {
+			ret, err = l.storage.Entries(uint64(begIdx), l.curLogIdx+1)
+		} else {
+			ret, err = l.storage.Entries(uint64(begIdx), uint64(endIdx)+1)
+		}
+		if err != nil {
+			return []pb.Entry{}
+		}
+		return ret
+	} else if begIdx < int(l.entries[0].Index) {
+		ret, err = l.storage.Entries(uint64(begIdx), l.entries[0].Index+1)
+		if err != nil {
+			ret = []pb.Entry{}
+		}
+	}
 	beg := begIdx - int(l.entries[0].Index)
 	end := endIdx - int(l.entries[0].Index)
 	for i := beg; i >= 0 && i <= end && i < len(l.entries); i++ {

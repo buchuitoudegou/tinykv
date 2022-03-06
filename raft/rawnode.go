@@ -70,8 +70,7 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
-	prevCommittedIdx uint64
-	hardState        pb.HardState
+	hardState pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -86,9 +85,8 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	}
 	raftInst := newRaft(config)
 	return &RawNode{
-		Raft:             raftInst,
-		hardState:        hardState,
-		prevCommittedIdx: 0, // no entries committed
+		Raft:      raftInst,
+		hardState: hardState,
 	}, nil
 }
 
@@ -157,8 +155,7 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	committedEntries := rn.Raft.RaftLog.GetEntries(int(rn.prevCommittedIdx)+1, int(rn.Raft.RaftLog.committed))
-	rn.prevCommittedIdx = rn.Raft.RaftLog.committed // committed entries
+	committedEntries := rn.Raft.RaftLog.nextEnts()
 	msgs := rn.Raft.msgs
 	rn.Raft.msgs = []pb.Message{}
 	ret := Ready{
@@ -196,7 +193,7 @@ func (rn *RawNode) HasReady() bool {
 		return true
 	}
 	// stabled and committed entries
-	return rn.Raft.RaftLog.committed > rn.prevCommittedIdx
+	return len(rn.Raft.RaftLog.nextEnts()) > 0
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
