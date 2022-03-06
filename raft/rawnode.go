@@ -71,6 +71,7 @@ type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
 	hardState pb.HardState
+	softState *SoftState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -87,6 +88,10 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	return &RawNode{
 		Raft:      raftInst,
 		hardState: hardState,
+		softState: &SoftState{
+			Lead:      0,
+			RaftState: StateFollower,
+		},
 	}, nil
 }
 
@@ -169,10 +174,21 @@ func (rn *RawNode) Ready() Ready {
 			Term:   rn.Raft.Term,
 		}
 	}
+	if rn.diffSoftState() {
+		ret.SoftState = &SoftState{
+			Lead:      rn.Raft.Lead,
+			RaftState: rn.Raft.State,
+		}
+		rn.softState = ret.SoftState
+	}
 	if len(msgs) > 0 {
 		ret.Messages = msgs
 	}
 	return ret
+}
+
+func (rn *RawNode) diffSoftState() bool {
+	return rn.Raft.Lead != rn.softState.Lead || rn.Raft.State != rn.softState.RaftState
 }
 
 func (rn *RawNode) diffHardState() bool {
@@ -185,7 +201,7 @@ func (rn *RawNode) HasReady() bool {
 	if len(rn.Raft.msgs) > 0 {
 		return true
 	}
-	if rn.diffHardState() {
+	if rn.diffHardState() || rn.diffSoftState() {
 		return true
 	}
 	unstabledEnts := rn.Raft.RaftLog.unstableEntries() // entries to be saved
