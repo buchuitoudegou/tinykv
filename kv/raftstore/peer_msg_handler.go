@@ -2,7 +2,6 @@ package raftstore
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -42,41 +41,22 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
-func encodeCmd(typ raft_cmdpb.CmdType, cf string, key, val []byte) []byte {
-	var ret string
-	switch typ {
-	case raft_cmdpb.CmdType_Put:
-		ret += "Put;"
-	case raft_cmdpb.CmdType_Delete:
-		ret += "Del;"
+func (d *peerMsgHandler) ackProposal(ackIdx uint64, expectTerm uint64, resp *raft_cmdpb.RaftCmdResponse, txn *badger.Txn) {
+	if len(d.proposals) > 0 {
+		proposal := d.proposals[0]
+		if proposal.index == ackIdx {
+			if proposal.term != expectTerm {
+				// 1. the proposal was proposed from the previous term, where this node was leader
+				// 2. the leader's transfered before it's committed
+				// 3. this proposal should not be successful
+				NotifyStaleReq(expectTerm, proposal.cb)
+			} else {
+				proposal.cb.Txn = txn
+				proposal.cb.Done(resp)
+			}
+		}
+		d.proposals = d.proposals[1:]
 	}
-	ret += cf + ";"
-	ret += string(key) + ";"
-	ret += string(val)
-	return []byte(ret)
-}
-
-func decodeCmd(data []byte) (raft_cmdpb.CmdType, string, []byte, []byte) {
-	var (
-		typ      raft_cmdpb.CmdType
-		cf       string
-		key, val []byte
-	)
-	temp := string(data)
-	ret := strings.Split(temp, ";")
-	if len(ret) != 4 {
-		return raft_cmdpb.CmdType_Invalid, "", []byte{}, []byte{}
-	}
-	switch ret[0] {
-	case "Put":
-		typ = raft_cmdpb.CmdType_Put
-	case "Del":
-		typ = raft_cmdpb.CmdType_Delete
-	}
-	cf = ret[1]
-	key = []byte(ret[2])
-	val = []byte(ret[3])
-	return typ, cf, key, val
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {
@@ -95,90 +75,85 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// 1. new committed key-val
 		// 2. new applyState
 		wb := engine_util.WriteBatch{}
-		indexToTypeM := make(map[uint64]raft_cmdpb.CmdType, 0)
 		for _, entry := range rd.CommittedEntries {
-			// committed entries
-			typ, cf, key, val := decodeCmd(entry.Data)
-			if typ == raft_cmdpb.CmdType_Invalid {
-				// noop entry
-				continue
+			// apply committed entries
+			var txn *badger.Txn
+			resp := &raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{
+					CurrentTerm: d.peer.Term(),
+				},
+				Responses: []*raft_cmdpb.Response{},
 			}
-			switch typ {
+			req := &raft_cmdpb.Request{}
+			req.Unmarshal(entry.Data) // decode raft cmd request
+			switch req.CmdType {
 			case raft_cmdpb.CmdType_Put:
-				indexToTypeM[entry.GetIndex()] = raft_cmdpb.CmdType_Put
-				wb.SetCF(cf, key, val)
+				wb.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: req.CmdType,
+					Put:     &raft_cmdpb.PutResponse{},
+				})
 			case raft_cmdpb.CmdType_Delete:
-				indexToTypeM[entry.GetIndex()] = raft_cmdpb.CmdType_Delete
-				wb.DeleteCF(cf, key)
+				wb.DeleteCF(req.Delete.Cf, req.Delete.Key)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: req.CmdType,
+					Delete:  &raft_cmdpb.DeleteResponse{},
+				})
+			case raft_cmdpb.CmdType_Get:
+				// read checkpoint
+				// 1. update applied index
+				d.peerStorage.applyState.AppliedIndex = entry.Index
+				wb.SetMeta(meta.ApplyStateKey((d.regionId)), d.peerStorage.applyState)
+				// 2. flush all previous write to DB
+				err := wb.WriteToDB(d.peerStorage.Engines.Kv)
+				if err != nil {
+					panic("fail to write kv to db")
+				}
+				// 3. read data
+				val, err := engine_util.GetCF(d.peer.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+				if err != nil {
+					val = []byte(err.Error())
+				}
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: req.CmdType,
+					Get:     &raft_cmdpb.GetResponse{Value: val},
+				})
+				// 4. new write batch
+				wb = engine_util.WriteBatch{}
+			case raft_cmdpb.CmdType_Snap:
+				// read checkpoint
+				// 1. update applied index
+				d.peerStorage.applyState.AppliedIndex = entry.Index
+				wb.SetMeta(meta.ApplyStateKey((d.regionId)), d.peerStorage.applyState)
+				// 2. flush all previous write to DB
+				err := wb.WriteToDB(d.peerStorage.Engines.Kv)
+				if err != nil {
+					panic("fail to write kv to db")
+				}
+				// 3. create new transaction
+				txn = d.peer.peerStorage.Engines.Kv.NewTransaction(false)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: req.CmdType,
+					Snap: &raft_cmdpb.SnapResponse{
+						Region: d.Region(),
+					},
+				})
+				// 4. new write batch
+				wb = engine_util.WriteBatch{}
 			}
+			d.ackProposal(entry.Index, entry.Term, resp, txn)
 		}
 		if len(rd.CommittedEntries) > 0 {
 			// save applyState
 			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 			wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		}
+		// flush the rest data
 		err := wb.WriteToDB(d.peerStorage.Engines.Kv)
 		if err != nil {
-			panic("err occurs when writing KV")
+			panic("fail to write db")
 		}
-		if len(rd.CommittedEntries) > 0 {
-			// update region
-			var (
-				start, end []byte
-			)
-			err = d.peerStorage.Engines.Kv.View(func(txn *badger.Txn) error {
-				iter := engine_util.NewCFIterator(engine_util.CfDefault, txn)
-				iter.Seek([]byte{}) // seek to first
-				defer iter.Close()
-				if !iter.Valid() {
-					return errors.New("iter not valid for start key")
-				} else {
-					start = iter.Item().Key()
-				}
-				// lstKey := iter.Item().Key()
-				// for ; iter.Valid(); iter.Next() {
-				// 	lstKey = iter.Item().Key()
-				// }
-				// end = lstKey
-				// fmt.Printf("id: %d, update region end: %s\n", d.peer.storeID(), string(end))
-				return nil
-			})
-			if err != nil {
-				log.Warnf("fail to get new region info: %s", err.Error())
-			}
-			curRegion := d.peer.Region()
-			curRegion.StartKey = start
-			curRegion.EndKey = end
-			d.peer.SetRegion(curRegion)
-		}
-		appliedIdx := d.peerStorage.applyState.AppliedIndex
-		newProposals := make([]*proposal, 0)
-		for idx := range d.peer.proposals {
-			if d.peer.proposals[idx].index <= appliedIdx &&
-				d.peer.proposals[idx].term == d.peer.Term() {
-				// 1. index <= appliedIdx and
-				// 2. propose term == current term
-				curIdx := d.peer.proposals[idx].index
-				resp := d.peer.proposals[idx].cb.Resp
-				if resp == nil {
-					// put or delete response
-					resp = &raft_cmdpb.RaftCmdResponse{
-						Header: &raft_cmdpb.RaftResponseHeader{
-							CurrentTerm: d.peer.Term(),
-						},
-						Responses: []*raft_cmdpb.Response{},
-					}
-					resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
-						CmdType: indexToTypeM[curIdx],
-					})
-					fmt.Printf("node %d apply and commit log idx: %d\n", d.peer.PeerId(), curIdx)
-				}
-				d.peer.proposals[idx].cb.Done(resp)
-			} else {
-				newProposals = append(newProposals, d.peer.proposals[idx])
-			}
-		}
-		d.peer.proposals = newProposals
+		// fmt.Printf("node %d flush up to logIdx %d\n", d.PeerId(), d.peerStorage.applyState.AppliedIndex)
 		d.peer.RaftGroup.Advance(rd)
 	}
 }
@@ -252,77 +227,33 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-	isReadOnly := true
-	proposal := &proposal{
-		cb:   cb,
-		term: d.peer.Term(),
-	}
-	curResp := &raft_cmdpb.RaftCmdResponse{
-		Header: &raft_cmdpb.RaftResponseHeader{
-			CurrentTerm: d.peer.Term(),
-		},
-	}
 	// currently, one RaftCmdRequest consists of only one Request
 	for _, req := range msg.Requests {
-		resp := &raft_cmdpb.Response{
-			CmdType: req.CmdType,
+		proposal := &proposal{
+			cb:    cb,
+			term:  d.peer.Term(),
+			index: d.peer.nextProposalIndex(),
 		}
+		rawReq, err := req.Marshal()
+		var (
+			key, val string
+		)
 		switch req.CmdType {
-		case raft_cmdpb.CmdType_Get:
-			val, err := engine_util.GetCF(d.peer.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
-			if err != nil {
-				resp.Get = &raft_cmdpb.GetResponse{
-					Value: []byte(err.Error()),
-				}
-			} else {
-				resp.Get = &raft_cmdpb.GetResponse{
-					Value: val,
-				}
-			}
-			curResp.Responses = append(curResp.Responses, resp)
-		case raft_cmdpb.CmdType_Put:
-			isReadOnly = false
-			nxtLogIdx := d.peer.RaftGroup.Raft.RaftLog.NextIndex()
-			curTerm := d.peer.Term()
-			proposal.index = nxtLogIdx
-			proposal.term = curTerm
-			d.peer.RaftGroup.Propose(encodeCmd(
-				req.CmdType,
-				req.Put.Cf,
-				req.Put.Key,
-				req.Put.Value,
-			))
-			fmt.Printf("put %s %s by log idx %d\n", string(req.Put.Key), string(req.Put.Value), nxtLogIdx)
 		case raft_cmdpb.CmdType_Delete:
-			isReadOnly = false
-			nxtLogIdx := d.peer.RaftGroup.Raft.RaftLog.NextIndex()
-			curTerm := d.peer.Term()
-			proposal.index = nxtLogIdx
-			proposal.term = curTerm
-			d.peer.RaftGroup.Propose(encodeCmd(
-				req.CmdType,
-				req.Delete.Cf,
-				req.Delete.Key,
-				[]byte(""),
-			))
-		case raft_cmdpb.CmdType_Snap:
-			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // snapshot read
-			snap := &raft_cmdpb.SnapResponse{
-				Region: &metapb.Region{
-					Id:       d.PeerId(),
-					StartKey: d.Region().StartKey,
-					EndKey:   d.Region().EndKey,
-					Peers:    []*metapb.Peer{}, // todo: fill this array
-				},
-			}
-			resp.Snap = snap
-			curResp.Responses = append(curResp.Responses, resp)
+			key = string(req.Delete.Key)
+		case raft_cmdpb.CmdType_Get:
+			key = string(req.Get.Key)
+		case raft_cmdpb.CmdType_Put:
+			key = string(req.Put.Key)
+			val = string(req.Put.Value)
 		}
+		// fmt.Printf("node %d: propose %s, key: %s, val: %s with logIdx: %d\n", d.PeerId(), req.CmdType.String(), key, val, proposal.index)
+		if err != nil {
+			panic("fail to encode request to byte")
+		}
+		d.RaftGroup.Propose(rawReq)
+		d.peer.proposals = append(d.peer.proposals, proposal)
 	}
-	if isReadOnly {
-		proposal.cb.Resp = curResp
-	}
-	d.peer.proposals = append(d.peer.proposals, proposal)
 }
 
 func (d *peerMsgHandler) onTick() {

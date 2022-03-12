@@ -347,7 +347,7 @@ func (r *Raft) becomeLeader() {
 			voteMsg += fmt.Sprintf("%d,", v)
 		}
 	}
-	fmt.Printf("%d become leader, vote by %s at term %d\n", r.id, voteMsg, r.Term)
+	// fmt.Printf("%d become leader, vote by %s at term %d with lastLogIdx: %d\n", r.id, voteMsg, r.Term, r.RaftLog.LastIndex())
 	r.Step(pb.Message{
 		From:    r.id,
 		To:      r.id,
@@ -461,14 +461,22 @@ func (r *Raft) Step(m pb.Message) error {
 					if r.Term < m.Term {
 						// set to term and become follower
 						r.becomeFollower(m.Term, 0)
-						r.msgs = append(r.msgs, pb.Message{
-							From:    r.id,
-							To:      m.From,
-							MsgType: pb.MessageType_MsgRequestVoteResponse,
-							Term:    r.Term,
-							Reject:  false, // grant vote
-						})
-						r.Vote = m.From
+						curLstLogTerm, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
+						if (curLstLogTerm < m.LogTerm) || (curLstLogTerm == m.LogTerm && m.Index >= r.RaftLog.LastIndex()) {
+							// at least up-to-date:
+							// 1. ends with different term, then the larger term is more up-to-date
+							// 2. ends with same term, then the longer logs is more up-to-date
+							r.msgs = append(r.msgs, pb.Message{
+								From:    r.id,
+								To:      m.From,
+								MsgType: pb.MessageType_MsgRequestVoteResponse,
+								Term:    r.Term,
+								Reject:  false, // grant vote
+							})
+							r.Vote = m.From
+						} else {
+							r.msgs = append(r.msgs, rejectVoteMsg)
+						}
 					} else {
 						r.msgs = append(r.msgs, rejectVoteMsg)
 					}
@@ -626,7 +634,7 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 					if commitIdx != r.RaftLog.committed {
 						// commit new entry
-						fmt.Printf("node %d commit log %d\n", r.id, commitIdx)
+						// fmt.Printf("node %d commit log %d\n", r.id, commitIdx)
 						r.RaftLog.committed = uint64(commitIdx)
 						for id := range r.Prs {
 							if id != r.id {
@@ -699,25 +707,31 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				// r.RaftLog.DeleteFromIdx(int(m.Index) - 1)
 				replyMsg.Index = r.RaftLog.LastIndex()
 				r.msgs = append(r.msgs, replyMsg)
+				// fmt.Printf("node %d reject prevlogIdx: %d, term: %d\n", r.id, m.Index, m.LogTerm)
 				return
 			}
 			// legal
 			for i := range m.Entries {
 				r.RaftLog.AppendEntry(m.Entries[i].Index, *m.Entries[i])
+				// fmt.Printf("node %d replicate to %d\n", r.id, r.RaftLog.LastIndex())
 			}
 			if m.Commit > r.RaftLog.committed {
 				// commit min(leaderCommit, last new entry)
 				// last new entry: the entry replicated from the leader
 				// entries after it is possibly illegal
-				if len(m.Entries) > 0 {
-					lstEntriesIdx := m.Entries[len(m.Entries)-1].Index
-					r.RaftLog.committed = min(m.Commit, min(r.RaftLog.LastIndex(), lstEntriesIdx))
-				} else {
-					// no new entry
-					// prevLogIdx is the newest
-					r.RaftLog.committed = min(m.Commit, m.Index)
-				}
-				fmt.Printf("node %d commit up to %d\n", r.id, r.RaftLog.committed)
+				// if len(m.Entries) > 0 {
+				// 	lstEntriesIdx := m.Entries[len(m.Entries)-1].Index
+				// 	r.RaftLog.committed = min(m.Commit, min(r.RaftLog.LastIndex(), lstEntriesIdx))
+				// 	// fmt.Printf("node %d commit up to %d, lastLogIdx: %d, lastEntriesIdx: %d, leaderCommit: %d\n", r.id, r.RaftLog.committed, r.RaftLog.LastIndex(), lstEntriesIdx, m.Commit)
+
+				// } else {
+				// 	// no new entry
+				// 	// prevLogIdx is the newest
+				// 	r.RaftLog.committed = min(m.Commit, m.Index)
+				// 	// fmt.Printf("node %d commit up to %d, lastLogIdx: %d, leaderCommit: %d\n", r.id, r.RaftLog.committed, r.RaftLog.LastIndex(), m.Commit)
+				// }
+				r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
+				// fmt.Printf("node %d commit up to %d with leader's commit %d, lastEntriesIdx: %d\n", r.id, r.RaftLog.committed, m.Commit, m.Index+uint64(len(m.Entries)))
 			}
 			replyMsg.Reject = false
 			replyMsg.Index = r.RaftLog.LastIndex()
