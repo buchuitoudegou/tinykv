@@ -235,18 +235,18 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			index: d.peer.nextProposalIndex(),
 		}
 		rawReq, err := req.Marshal()
-		var (
-			key, val string
-		)
-		switch req.CmdType {
-		case raft_cmdpb.CmdType_Delete:
-			key = string(req.Delete.Key)
-		case raft_cmdpb.CmdType_Get:
-			key = string(req.Get.Key)
-		case raft_cmdpb.CmdType_Put:
-			key = string(req.Put.Key)
-			val = string(req.Put.Value)
-		}
+		// var (
+		// 	key, val string
+		// )
+		// switch req.CmdType {
+		// case raft_cmdpb.CmdType_Delete:
+		// 	key = string(req.Delete.Key)
+		// case raft_cmdpb.CmdType_Get:
+		// 	key = string(req.Get.Key)
+		// case raft_cmdpb.CmdType_Put:
+		// 	key = string(req.Put.Key)
+		// 	val = string(req.Put.Value)
+		// }
 		// fmt.Printf("node %d: propose %s, key: %s, val: %s with logIdx: %d\n", d.PeerId(), req.CmdType.String(), key, val, proposal.index)
 		if err != nil {
 			panic("fail to encode request to byte")
