@@ -114,6 +114,18 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if l.curLogIdx == 0 || i == 0 || i > l.LastIndex() {
 		return 0, fmt.Errorf("index out of range")
 	}
+	if len(l.entries) > 0 && i >= l.entries[0].Index {
+		// get term from entries in memory
+		idx := i - l.entries[0].Index
+		return l.entries[idx].Term, nil
+	}
+	// try get entry's term from storage
+	if l.pendingSnapshot != nil && i == l.pendingSnapshot.Metadata.Index {
+		// get last log term from snapshot
+		return l.pendingSnapshot.Metadata.Term, nil
+	}
+	// get entry from storage
+	// WARNING: the storage may probably compact the logs
 	ents := l.GetEntries(int(i), int(i))
 	if len(ents) > 0 {
 		return ents[0].Term, nil
@@ -161,10 +173,6 @@ func (l *RaftLog) DeleteFromIdx(idx int) {
 }
 
 func (l *RaftLog) GetEntries(begIdx int, endIdx int) []pb.Entry {
-	// if len(l.entries) == 0 || begIdx < int(l.entries[0].Index) {
-	// 	// todo: get entries from stroage
-	// 	return []pb.Entry{}
-	// }
 	ret := []pb.Entry{}
 	var err error
 	if len(l.entries) == 0 {
@@ -178,7 +186,8 @@ func (l *RaftLog) GetEntries(begIdx int, endIdx int) []pb.Entry {
 		}
 		return ret
 	} else if begIdx < int(l.entries[0].Index) {
-		ret, err = l.storage.Entries(uint64(begIdx), l.entries[0].Index+1)
+		// WARNING: getting entries from storage is unreliable!
+		ret, err = l.storage.Entries(uint64(begIdx), min(l.entries[0].Index+1, uint64(endIdx)+1))
 		if err != nil {
 			ret = []pb.Entry{}
 		}
@@ -212,4 +221,26 @@ func (l *RaftLog) AppendEntry(index uint64, newEntry pb.Entry) {
 		l.entries = l.entries[:i+1]
 		l.curLogIdx = newEntry.Index
 	}
+}
+
+func (l *RaftLog) ApplySnapshot(snapshot *pb.Snapshot) {
+	// clear entries
+	l.entries = []pb.Entry{}
+	l.applied, l.committed = snapshot.Metadata.Index, snapshot.Metadata.Index
+	l.curLogIdx = snapshot.Metadata.Index
+	l.pendingSnapshot = snapshot
+}
+
+func (l *RaftLog) GetSnapshot(begIdx uint64) *pb.Snapshot {
+	if l.pendingSnapshot == nil {
+		// todo: if pendingsnapshot is applied, get snapshot from storage
+		return nil
+	}
+	if len(l.entries) == 0 && begIdx <= l.LastIndex() {
+		return l.pendingSnapshot
+	}
+	if len(l.entries) > 0 && begIdx < l.entries[0].Index {
+		return l.pendingSnapshot
+	}
+	return nil
 }

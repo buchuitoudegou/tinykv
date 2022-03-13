@@ -218,6 +218,15 @@ func (r *Raft) sendAppend(to uint64) bool {
 	lstIndex := r.RaftLog.LastIndex()
 	if lstIndex >= r.Prs[to].Next {
 		begIdx, endIdx := r.Prs[to].Next, lstIndex
+		snapshot := r.RaftLog.GetSnapshot(begIdx)
+		if snapshot != nil {
+			// entries might be compacted
+			// send snapshot first
+			msg.MsgType = pb.MessageType_MsgSnapshot
+			msg.Snapshot = snapshot
+			r.msgs = append(r.msgs, msg)
+			return true
+		}
 		prevLogIndex := begIdx - 1
 		prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 		sendEntries := r.RaftLog.GetEntries(int(begIdx), int(endIdx))
@@ -380,10 +389,8 @@ func (r *Raft) Step(m pb.Message) error {
 	}
 	switch r.State {
 	case StateFollower:
-
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
-
 			if len(r.Prs) == 1 {
 				r.becomeCandidate()
 				r.becomeLeader() // win immediately
@@ -396,8 +403,9 @@ func (r *Raft) Step(m pb.Message) error {
 			r.broadcastVoteRequest()
 		case pb.MessageType_MsgHeartbeat:
 			r.handleHeartbeat(m)
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		case pb.MessageType_MsgRequestVote:
-
 			// request a vote
 			if r.Term > m.Term || (r.Term == m.Term && r.Vote != 0 && r.Vote != m.From) {
 				// 1. current term is larger
@@ -651,7 +659,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 	switch r.State {
 	case StateFollower:
-
 		if r.Term > m.Term {
 			// reject
 			replyMsg.Reject = true
@@ -771,6 +778,27 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if r.Term > m.Term {
+		// reject
+		return
+	}
+	if r.Term != m.Term || r.Lead != m.From {
+		r.becomeFollower(m.Term, m.From)
+	}
+	snapshot := m.Snapshot
+	// at least up-to-date
+	curLstLogTerm, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
+	if curLstLogTerm < snapshot.Metadata.Term ||
+		(curLstLogTerm == snapshot.Metadata.Term && snapshot.Metadata.Index >= r.RaftLog.LastIndex()) {
+		// 1. update term
+		r.Term = snapshot.Metadata.Term
+		// 2. install peers
+		for _, pId := range snapshot.Metadata.ConfState.Nodes {
+			r.Prs[pId] = &Progress{}
+		}
+		// 3. install logs
+		r.RaftLog.ApplySnapshot(snapshot)
+	}
 }
 
 // addNode add a new node to raft group
