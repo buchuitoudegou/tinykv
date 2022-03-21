@@ -232,15 +232,18 @@ func (l *RaftLog) ApplySnapshot(snapshot *pb.Snapshot) {
 }
 
 func (l *RaftLog) GetSnapshot(begIdx uint64) *pb.Snapshot {
-	if l.pendingSnapshot == nil {
-		// todo: if pendingsnapshot is applied, get snapshot from storage
-		return nil
-	}
-	if len(l.entries) == 0 && begIdx <= l.LastIndex() {
-		return l.pendingSnapshot
-	}
-	if len(l.entries) > 0 && begIdx < l.entries[0].Index {
-		return l.pendingSnapshot
+	if (len(l.entries) == 0 && begIdx <= l.LastIndex()) ||
+		(len(l.entries) > 0 && begIdx < l.entries[0].Index) {
+		// get entries from storage
+		if l.pendingSnapshot != nil {
+			return l.pendingSnapshot
+		} else {
+			snapshot, err := l.storage.Snapshot()
+			if err != nil {
+				return nil
+			}
+			return &snapshot
+		}
 	}
 	return nil
 }

@@ -184,6 +184,9 @@ func (rn *RawNode) Ready() Ready {
 	if len(msgs) > 0 {
 		ret.Messages = msgs
 	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		ret.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
 	return ret
 }
 
@@ -206,6 +209,9 @@ func (rn *RawNode) HasReady() bool {
 	}
 	unstabledEnts := rn.Raft.RaftLog.unstableEntries() // entries to be saved
 	if len(unstabledEnts) > 0 {
+		return true
+	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
 		return true
 	}
 	// stabled and committed entries
