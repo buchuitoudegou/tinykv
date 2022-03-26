@@ -51,12 +51,37 @@ func (d *peerMsgHandler) ackProposal(ackIdx uint64, expectTerm uint64, resp *raf
 				// 3. this proposal should not be successful
 				NotifyStaleReq(expectTerm, proposal.cb)
 			} else {
-				proposal.cb.Txn = txn
-				proposal.cb.Done(resp)
+				if proposal.cb != nil {
+					proposal.cb.Txn = txn
+					proposal.cb.Done(resp)
+				}
 			}
 		}
 		d.proposals = d.proposals[1:]
 	}
+}
+
+func (d *peerMsgHandler) tryHandleAdminReq(data []byte) bool {
+	req := &raft_cmdpb.AdminRequest{}
+	err := req.Unmarshal(data)
+	if err != nil {
+		// not a admin request
+		// fail silently
+		return false
+	}
+	switch req.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		wb := engine_util.WriteBatch{}
+		d.ScheduleCompactLog(req.CompactLog.CompactIndex)
+		d.peerStorage.applyState.TruncatedState.Index = req.CompactLog.CompactIndex
+		d.peerStorage.applyState.TruncatedState.Term = req.CompactLog.CompactTerm
+		wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		err := wb.WriteToDB(d.peerStorage.Engines.Kv)
+		if err != nil {
+			panic("fail to flush new applystate after compaction")
+		}
+	}
+	return true
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {
@@ -77,6 +102,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		wb := engine_util.WriteBatch{}
 		for _, entry := range rd.CommittedEntries {
 			// apply committed entries
+			if d.tryHandleAdminReq(entry.Data) {
+				// is admin request
+				d.ackProposal(entry.Index, entry.Term, nil, nil)
+				continue
+			}
 			var txn *badger.Txn
 			resp := &raft_cmdpb.RaftCmdResponse{
 				Header: &raft_cmdpb.RaftResponseHeader{
@@ -85,9 +115,13 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				Responses: []*raft_cmdpb.Response{},
 			}
 			req := &raft_cmdpb.Request{}
-			req.Unmarshal(entry.Data) // decode raft cmd request
+			err := req.Unmarshal(entry.Data) // decode raft cmd request
+			if err != nil {
+				panic("fail to decode raft cmd from byte")
+			}
 			switch req.CmdType {
 			case raft_cmdpb.CmdType_Put:
+				fmt.Printf("node %d put %s, %s\n", d.PeerId(), string(req.Put.Key), string(req.Put.Value))
 				wb.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
 				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
 					CmdType: req.CmdType,
@@ -228,6 +262,19 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 	// Your Code Here (2B).
 	// currently, one RaftCmdRequest consists of only one Request
+	if msg.AdminRequest != nil {
+		proposal := &proposal{
+			cb:    cb,
+			term:  d.peer.Term(),
+			index: d.peer.nextProposalIndex(),
+		}
+		rawReq, err := msg.AdminRequest.Marshal()
+		if err != nil {
+			panic("fail to encode admin request to byte")
+		}
+		d.RaftGroup.Propose(rawReq)
+		d.peer.proposals = append(d.peer.proposals, proposal)
+	}
 	for _, req := range msg.Requests {
 		proposal := &proposal{
 			cb:    cb,

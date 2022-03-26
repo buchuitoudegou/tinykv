@@ -225,6 +225,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.Entries) > 0 {
 		lstIdx := rd.Entries[len(rd.Entries)-1].Index
 		rn.Raft.RaftLog.stabled = lstIdx
+		rn.Raft.RaftLog.maybeCompact()
 	}
 	if len(rd.CommittedEntries) > 0 {
 		lstIdx := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index

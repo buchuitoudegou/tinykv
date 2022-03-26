@@ -355,11 +355,23 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		kvWB.SetCF(engine_util.CfDefault, kvPrs.Key, kvPrs.Value)
 	}
 	ps.clearExtraData(snapData.Region)
-	ps.clearMeta(kvWB, raftWB)
+	err := ps.clearMeta(kvWB, raftWB)
+	if err != nil {
+		return nil, err
+	}
 	ps.SetRegion(snapData.Region)
-	kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), ps.region)
-	kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
-	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	err = kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), ps.region)
+	if err != nil {
+		return nil, err
+	}
+	err = kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+	if err != nil {
+		return nil, err
+	}
+	err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	if err != nil {
+		return nil, err
+	}
 	return &ApplySnapResult{
 		PrevRegion: prevRegion,
 		Region:     ps.region,
