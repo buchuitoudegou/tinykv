@@ -88,7 +88,19 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
-	l.entries = l.unstableEntries()
+	if len(l.entries) > 0 {
+		firstStableEnt, err := l.storage.FirstIndex()
+		if err != nil {
+			return
+		}
+		if firstStableEnt > l.entries[0].Index {
+			// logs before firstStableEnt have been gc-ed
+			nonCompactedIdx := firstStableEnt - l.entries[0].Index
+			entries := l.entries[nonCompactedIdx:]
+			l.entries = make([]pb.Entry, len(entries))
+			copy(l.entries, entries)
+		}
+	}
 }
 
 // unstableEntries return all the unstable entries
@@ -113,26 +125,42 @@ func (l *RaftLog) LastIndex() uint64 {
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	if l.curLogIdx == 0 || i == 0 || i > l.LastIndex() {
-		return 0, fmt.Errorf("index out of range")
+		return 0, fmt.Errorf("index out of range: curlogIdx: %d, want: %d\n", l.curLogIdx, i)
 	}
 	if len(l.entries) > 0 && i >= l.entries[0].Index {
 		// get term from entries in memory
 		idx := i - l.entries[0].Index
 		return l.entries[idx].Term, nil
 	}
-	// try get entry's term from storage
-	if l.pendingSnapshot != nil && i == l.pendingSnapshot.Metadata.Index {
-		// get last log term from snapshot
-		return l.pendingSnapshot.Metadata.Term, nil
+	// // try get entry's term from storage
+	// if l.pendingSnapshot != nil && i == l.pendingSnapshot.Metadata.Index {
+	// 	// get last log term from snapshot
+	// 	return l.pendingSnapshot.Metadata.Term, nil
+	// }
+	// // get entry from storage
+	// // WARNING: the storage may probably compact the logs
+	// ents := l.GetEntries(int(i), int(i))
+	// if len(ents) > 0 {
+	// 	return ents[0].Term, nil
+	// } else {
+	// 	return 0, nil
+	// }
+	term, err := l.storage.Term(i)
+	if err == nil {
+		// log hasn't been gc-ed
+		return term, nil
 	}
-	// get entry from storage
-	// WARNING: the storage may probably compact the logs
-	ents := l.GetEntries(int(i), int(i))
-	if len(ents) > 0 {
-		return ents[0].Term, nil
-	} else {
-		return 0, nil
+	if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+		// log has been gc-ed
+		if i == l.pendingSnapshot.Metadata.Index {
+			// get last index's term
+			return l.pendingSnapshot.Metadata.Term, nil
+		} else if i < l.pendingSnapshot.Metadata.Index {
+			// fail to get term from snapshot
+			err = ErrCompacted
+		}
 	}
+	return term, err
 }
 
 func (l *RaftLog) NextIndex() uint64 {
@@ -202,6 +230,11 @@ func (l *RaftLog) GetEntries(begIdx int, endIdx int) []pb.Entry {
 }
 
 func (l *RaftLog) AppendEntry(index uint64, newEntry pb.Entry) {
+	if len(l.entries) == 0 && index < l.NextIndex() {
+		// attempt to insert entry to persisted state
+		// illegal
+		return
+	}
 	logTerm, _ := l.Term(index)
 	if index == l.NextIndex() {
 		l.entries = append(l.entries, newEntry)
@@ -230,21 +263,4 @@ func (l *RaftLog) ApplySnapshot(snapshot *pb.Snapshot) {
 	l.applied, l.committed = snapshot.Metadata.Index, snapshot.Metadata.Index
 	l.curLogIdx = snapshot.Metadata.Index
 	l.pendingSnapshot = snapshot
-}
-
-func (l *RaftLog) GetSnapshot(begIdx uint64) *pb.Snapshot {
-	if (len(l.entries) == 0 && begIdx <= l.LastIndex()) ||
-		(len(l.entries) > 0 && begIdx < l.entries[0].Index) {
-		// get entries from storage
-		if l.pendingSnapshot != nil {
-			return l.pendingSnapshot
-		} else {
-			snapshot, err := l.storage.Snapshot()
-			if err != nil {
-				return nil
-			}
-			return &snapshot
-		}
-	}
-	return nil
 }

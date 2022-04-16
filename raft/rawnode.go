@@ -184,7 +184,7 @@ func (rn *RawNode) Ready() Ready {
 	if len(msgs) > 0 {
 		ret.Messages = msgs
 	}
-	if rn.Raft.RaftLog.pendingSnapshot != nil {
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
 		ret.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
 	}
 	return ret
@@ -211,7 +211,7 @@ func (rn *RawNode) HasReady() bool {
 	if len(unstabledEnts) > 0 {
 		return true
 	}
-	if rn.Raft.RaftLog.pendingSnapshot != nil {
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
 		return true
 	}
 	// stabled and committed entries
@@ -233,6 +233,10 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 	if rd.HardState.Term != 0 {
 		rn.hardState = rd.HardState
+	}
+	if !IsEmptySnap(&rd.Snapshot) {
+		// successfully applied
+		rn.Raft.RaftLog.pendingSnapshot = nil
 	}
 }
 

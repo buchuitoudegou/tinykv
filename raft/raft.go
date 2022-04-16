@@ -218,17 +218,22 @@ func (r *Raft) sendAppend(to uint64) bool {
 	lstIndex := r.RaftLog.LastIndex()
 	if lstIndex >= r.Prs[to].Next {
 		begIdx, endIdx := r.Prs[to].Next, lstIndex
-		snapshot := r.RaftLog.GetSnapshot(begIdx)
-		if snapshot != nil {
-			// entries might be compacted
-			// send snapshot first
-			msg.MsgType = pb.MessageType_MsgSnapshot
-			msg.Snapshot = snapshot
-			r.msgs = append(r.msgs, msg)
-			return true
-		}
 		prevLogIndex := begIdx - 1
-		prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+		prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+		if err != nil {
+			if err == ErrCompacted {
+				// entries might be compacted
+				// send snapshot first
+				snapshot, err := r.RaftLog.storage.Snapshot()
+				if err != nil {
+					return false
+				}
+				msg.MsgType = pb.MessageType_MsgSnapshot
+				msg.Snapshot = &snapshot
+				r.msgs = append(r.msgs, msg)
+				return true
+			}
+		}
 		sendEntries := r.RaftLog.GetEntries(int(begIdx), int(endIdx))
 		msg.Index = prevLogIndex
 		msg.LogTerm = prevLogTerm
@@ -688,7 +693,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		// legal
 		for i := range m.Entries {
 			r.RaftLog.AppendEntry(m.Entries[i].Index, *m.Entries[i])
-			// fmt.Printf("node %d replicate to %d\n", r.id, r.RaftLog.LastIndex())
+			fmt.Printf("node %d replicate to %d\n", r.id, r.RaftLog.LastIndex())
 		}
 		if m.Commit > r.RaftLog.committed {
 			// commit min(leaderCommit, last new entry)
@@ -706,7 +711,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			// 	// fmt.Printf("node %d commit up to %d, lastLogIdx: %d, leaderCommit: %d\n", r.id, r.RaftLog.committed, r.RaftLog.LastIndex(), m.Commit)
 			// }
 			r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
-			// fmt.Printf("node %d commit up to %d with leader's commit %d, lastEntriesIdx: %d\n", r.id, r.RaftLog.committed, m.Commit, m.Index+uint64(len(m.Entries)))
+			fmt.Printf("node %d commit up to %d with leader's commit %d, lastEntriesIdx: %d\n", r.id, r.RaftLog.committed, m.Commit, m.Index+uint64(len(m.Entries)))
 		}
 		replyMsg.Reject = false
 		replyMsg.Index = r.RaftLog.LastIndex()
@@ -798,6 +803,15 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		}
 		// 3. install logs
 		r.RaftLog.ApplySnapshot(snapshot)
+		fmt.Printf("node %d commit (by snapshot) up to %d with leader's commit %d, lastIdx: %d\n", r.id, r.RaftLog.committed, m.Commit, r.RaftLog.LastIndex())
+		r.msgs = append(r.msgs, pb.Message{
+			From:    r.id,
+			To:      m.From,
+			Term:    r.Term,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Reject:  false,
+			Index:   r.RaftLog.LastIndex(),
+		})
 	}
 }
 
