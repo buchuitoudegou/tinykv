@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"time"
 
@@ -147,6 +148,7 @@ func (bs *Raftstore) loadPeers() ([]*peer, error) {
 				return errors.WithStack(err)
 			}
 			region := localState.Region
+			fmt.Printf("region to create: %v\n", region)
 			if localState.State == rspb.PeerState_Tombstone {
 				tombStoneCount++
 				bs.clearStaleMeta(kvWB, raftWB, localState)

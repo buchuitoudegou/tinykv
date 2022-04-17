@@ -342,25 +342,16 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.raftState.LastTerm = snapshot.Metadata.Term
 	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
-	notifier := make(chan bool)
-	ps.regionSched <- runner.RegionTaskApply{
-		RegionId: snapData.Region.Id,
-		SnapMeta: snapshot.Metadata,
-		StartKey: snapData.Region.StartKey,
-		EndKey:   snapData.Region.EndKey,
-		Notifier: notifier,
-	}
-	<-notifier // wait for creating new files
-	for _, kvPrs := range snapData.Data {
-		kvWB.SetCF(engine_util.CfDefault, kvPrs.Key, kvPrs.Value)
-	}
 	ps.clearExtraData(snapData.Region)
 	err := ps.clearMeta(kvWB, raftWB)
 	if err != nil {
 		return nil, err
 	}
 	ps.SetRegion(snapData.Region)
-	err = kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), ps.region)
+	fmt.Printf("snapshot region: %v\n", snapData.Region)
+	localState := new(rspb.RegionLocalState)
+	localState.Region = ps.region
+	err = kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), localState)
 	if err != nil {
 		return nil, err
 	}
@@ -372,6 +363,22 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	if err != nil {
 		return nil, err
 	}
+	err = kvWB.WriteToDB(ps.Engines.Kv)
+	if err != nil {
+		return nil, err
+	}
+	ps.snapState = snap.SnapState{
+		StateType: snap.SnapState_Applying,
+	}
+	notifier := make(chan bool)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.Id,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.StartKey,
+		EndKey:   snapData.Region.EndKey,
+		Notifier: notifier,
+	}
+	<-notifier // wait for ingesting files
 	return &ApplySnapResult{
 		PrevRegion: prevRegion,
 		Region:     ps.region,
@@ -390,7 +397,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		err        error
 	)
 	kvWb, raftWb := &engine_util.WriteBatch{}, &engine_util.WriteBatch{}
-	if ready.Snapshot.Data != nil {
+	if len(ready.Snapshot.Data) > 0 {
 		// snapshot exists
 		snapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWb, raftWb)
 	}
